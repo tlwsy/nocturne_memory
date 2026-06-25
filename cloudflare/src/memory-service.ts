@@ -37,7 +37,7 @@ export type NodeView = {
   content: string;
   priority: number;
   disclosure: string;
-  children: Array<{ name: string; path: string; uri: string; priority: number; disclosure: string | null; node_uuid: string }>;
+  children: Array<{ name: string; path: string; uri: string; priority: number; disclosure: string | null; node_uuid: string; content_snippet?: string; approx_children_count?: number }>;
   aliases: Array<{ domain: string; path: string; uri: string }>;
   glossary_keywords: string[];
   attachments: Array<{ id: string; filename: string; content_type: string; size_bytes: number; created_at: string }>;
@@ -237,14 +237,16 @@ export class MemoryService {
 
   async children(domain: string, path: string): Promise<NodeView["children"]> {
     const prefix = normalizePath(path);
-    const depthExpr = "length(path)-length(replace(path,'/',''))";
+    const depthExpr = "length(p.path)-length(replace(p.path,'/',''))";
     const parentDepth = prefix ? prefix.split("/").length - 1 : -1;
-    const rows = await this.all<{ path: string; node_uuid: string; priority: number | null; disclosure: string | null }>(
-      `SELECT p.path,p.node_uuid,e.priority,e.disclosure
+    const rows = await this.all<{ path: string; node_uuid: string; priority: number | null; disclosure: string | null; content: string | null; approx_children_count: number }>(
+      `SELECT p.path,p.node_uuid,e.priority,e.disclosure,sd.content,
+              (SELECT count(*) FROM paths c WHERE c.namespace=p.namespace AND c.domain=p.domain AND c.path LIKE p.path || '/%') AS approx_children_count
        FROM paths p LEFT JOIN edges e ON p.edge_id=e.id
+       LEFT JOIN search_documents sd ON sd.namespace=p.namespace AND sd.domain=p.domain AND sd.path=p.path
        WHERE p.namespace=? AND p.domain=? AND p.path<>?
          AND (?='' AND instr(p.path,'/')=0 OR ?<>'' AND p.path LIKE ? AND ${depthExpr}=?)
-       ORDER BY coalesce(e.priority,0) DESC,p.path`,
+       ORDER BY coalesce(e.priority,999),p.path`,
       this.namespace,
       domain,
       prefix,
@@ -260,6 +262,8 @@ export class MemoryService {
       priority: r.priority ?? 0,
       disclosure: r.disclosure,
       node_uuid: r.node_uuid,
+      content_snippet: r.content ? (r.content.length > 160 ? `${r.content.slice(0, 160)}…` : r.content) : "",
+      approx_children_count: r.approx_children_count ?? 0,
     }));
   }
 

@@ -7,6 +7,53 @@ import { makeUri, namespaceFromRequest, normalizePath, parseMemoryUri } from "./
 type Vars = { namespace: string; service: MemoryService };
 export const api = new Hono<{ Bindings: AppEnv; Variables: Vars }>();
 
+function breadcrumbs(path: string): Array<{ path: string; label: string }> {
+  const items = [{ path: "", label: "root" }];
+  let accumulated = "";
+  for (const segment of normalizePath(path).split("/").filter(Boolean)) {
+    accumulated = accumulated ? `${accumulated}/${segment}` : segment;
+    items.push({ path: accumulated, label: segment });
+  }
+  return items;
+}
+
+function toBrowseNodePayload(view: Awaited<ReturnType<MemoryService["getNode"]>>) {
+  const name = view.path ? view.path.split("/").at(-1) || view.path : "root";
+  const currentUri = makeUri(view.domain, view.path);
+  const aliases = view.aliases.map((alias) => alias.uri).filter((uri) => uri !== currentUri);
+  return {
+    ...view,
+    node: {
+      path: view.path,
+      domain: view.domain,
+      uri: currentUri,
+      name,
+      content: view.content,
+      priority: view.priority,
+      disclosure: view.disclosure || null,
+      created_at: null,
+      is_virtual: view.node_uuid === null,
+      aliases,
+      node_uuid: view.node_uuid,
+      glossary_keywords: view.glossary_keywords,
+      glossary_matches: [],
+      attachments: view.attachments,
+    },
+    children: view.children.map((child) => ({
+      domain: view.domain,
+      path: child.path,
+      uri: child.uri,
+      name: child.name,
+      priority: child.priority,
+      disclosure: child.disclosure,
+      node_uuid: child.node_uuid,
+      content_snippet: child.content_snippet ?? "",
+      approx_children_count: child.approx_children_count ?? 0,
+    })),
+    breadcrumbs: breadcrumbs(view.path),
+  };
+}
+
 api.use("*", async (c, next) => {
   const namespace = namespaceFromRequest(c.req.raw);
   c.set("namespace", namespace);
@@ -18,19 +65,42 @@ api.onError((err) => jsonError(err.message, 400));
 
 api.get("/health", (c) => c.json({ ok: true, runtime: "cloudflare-workers", storage: ["d1", "r2"] }));
 
-api.get("/browse/domains", async (c) => c.json({ domains: await c.var.service.validDomains() }));
+api.get("/browse/domains", async (c) => {
+  const domains = await c.var.service.validDomains();
+  const rows = await c.env.DB.prepare(
+    "SELECT domain,count(DISTINCT path) AS root_count FROM paths WHERE namespace=? AND instr(path,'/')=0 GROUP BY domain",
+  ).bind(c.var.namespace).all<{ domain: string; root_count: number }>();
+  const counts = new Map((rows.results ?? []).map((row) => [row.domain, row.root_count]));
+  const seen = new Set<string>();
+  const payload = domains.map((domain) => {
+    seen.add(domain);
+    return { domain, root_count: counts.get(domain) ?? 0 };
+  });
+  for (const [domain, root_count] of counts) {
+    if (!seen.has(domain)) payload.push({ domain, root_count });
+  }
+  return c.json(payload);
+});
 api.post("/browse/domains", async (c) => {
   const body = await c.req.json<{ domain: string }>();
-  return c.json({ domains: await c.var.service.addDomain(body.domain) });
+  const before = await c.var.service.validDomains();
+  const domains = await c.var.service.addDomain(body.domain);
+  return c.json({ success: true, added: !before.includes(body.domain), domain: body.domain, domains });
 });
-api.delete("/browse/domains/:domain", async (c) => c.json({ domains: await c.var.service.deleteDomain(c.req.param("domain")) }));
+api.delete("/browse/domains/:domain", async (c) => {
+  const domain = c.req.param("domain");
+  const domains = await c.var.service.deleteDomain(domain);
+  return c.json({ success: true, domain, domains });
+});
 api.get("/browse/namespaces", async (c) => c.json({ namespaces: await c.var.service.listNamespaces() }));
 
 api.get("/browse/node", async (c) => {
   const domain = c.req.query("domain") || "core";
   const path = c.req.query("path") || "";
   const navOnly = c.req.query("nav_only") === "true";
-  return c.json(await c.var.service.getNode(domain, path, navOnly));
+  const view = await c.var.service.getNode(domain, path, navOnly);
+  if (path && !view.node_uuid) return jsonError(`Path not found: ${makeUri(domain, path)}`, 404);
+  return c.json(toBrowseNodePayload(view));
 });
 
 api.post("/browse/node", async (c) => {
@@ -52,18 +122,23 @@ api.delete("/browse/node", async (c) => {
 });
 
 api.post("/browse/node/alias", async (c) => {
-  const body = await c.req.json<{ source_uri?: string; target_uri?: string; alias_uri?: string; new_uri?: string; priority?: number; disclosure?: string }>();
-  const targetUri = body.target_uri ?? body.source_uri ?? "";
-  const newUri = body.new_uri ?? body.alias_uri ?? "";
+  const body = await c.req.json<{ source_uri?: string; target_uri?: string; alias_uri?: string; new_uri?: string; new_path?: string; target_path?: string; new_domain?: string; target_domain?: string; priority?: number; disclosure?: string }>();
+  const targetUri = body.target_uri ?? body.source_uri ?? makeUri(body.target_domain ?? body.new_domain ?? "core", normalizePath(body.target_path ?? ""));
+  const newUri = body.new_uri ?? body.alias_uri ?? makeUri(body.new_domain ?? body.target_domain ?? "core", normalizePath(body.new_path ?? ""));
   return c.json(await c.var.service.addAlias(targetUri, newUri, body.priority ?? 0, body.disclosure ?? ""));
 });
 
 api.post("/browse/node/rename", async (c) => {
-  const body = await c.req.json<{ source_uri?: string; old_uri?: string; new_uri: string; priority?: number; disclosure?: string }>();
-  const source = body.source_uri ?? body.old_uri ?? "";
-  await c.var.service.addAlias(source, body.new_uri, body.priority ?? 0, body.disclosure ?? "");
+  const body = await c.req.json<{ source_uri?: string; old_uri?: string; new_uri?: string; path?: string; new_name?: string; domain?: string; priority?: number; disclosure?: string }>();
+  const domain = body.domain ?? "core";
+  const source = body.source_uri ?? body.old_uri ?? makeUri(domain, normalizePath(body.path ?? ""));
+  const oldPath = parseMemoryUri(source).path;
+  const parent = oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/")) : "";
+  const newPath = body.new_name ? normalizePath(parent ? `${parent}/${body.new_name}` : body.new_name) : parseMemoryUri(body.new_uri ?? "").path;
+  const newUri = body.new_uri ?? makeUri(domain, newPath);
+  await c.var.service.addAlias(source, newUri, body.priority ?? 0, body.disclosure ?? "");
   await c.var.service.deleteMemory(source);
-  return c.json({ success: true, uri: body.new_uri });
+  return c.json({ success: true, uri: newUri, new_path: newPath });
 });
 
 api.get("/browse/glossary", async (c) => {
@@ -96,7 +171,18 @@ api.delete("/browse/glossary", async (c) => {
 
 api.get("/browse/search", async (c) => {
   const results = await c.var.service.search(c.req.query("q") ?? "", c.req.query("domain") || undefined, Number(c.req.query("limit") ?? "20"));
-  return c.json({ results });
+  return c.json({
+    results: results.map((item) => {
+      const parsed = parseMemoryUri(item.uri);
+      return {
+        ...item,
+        domain: parsed.domain,
+        path: parsed.path,
+        name: parsed.path.split("/").at(-1) ?? parsed.path,
+        content_snippet: item.content.length > 220 ? `${item.content.slice(0, 220)}…` : item.content,
+      };
+    }),
+  });
 });
 
 api.get("/settings", async (c) => {
