@@ -38,7 +38,17 @@ function exportTable(db: Database.Database, table: string): { count: number; sql
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   const names = columns.map((column) => column.name);
   const rows = db.prepare(`SELECT ${names.map((name) => `"${name}"`).join(",")} FROM ${table}`).all() as Record<string, unknown>[];
-  const sql = rows.map((row) => `INSERT OR REPLACE INTO ${table}(${names.join(",")}) VALUES(${names.map((name) => quote(row[name])).join(",")});`);
+  const sql = rows.map((row) => {
+    const values = names.map((name) => (table === "memories" && name === "migrated_to" ? "NULL" : quote(row[name])));
+    return `INSERT OR REPLACE INTO ${table}(${names.join(",")}) VALUES(${values.join(",")});`;
+  });
+  if (table === "memories" && names.includes("migrated_to")) {
+    for (const row of rows) {
+      if (row.migrated_to !== null && row.migrated_to !== undefined) {
+        sql.push(`UPDATE memories SET migrated_to=${quote(row.migrated_to)} WHERE id=${quote(row.id)};`);
+      }
+    }
+  }
   return { count: rows.length, sql };
 }
 
@@ -57,7 +67,7 @@ function main(): void {
   const fk = db.pragma("foreign_key_check") as unknown[];
   if (fk.length) throw new Error(`Source DB foreign_key_check failed: ${JSON.stringify(fk.slice(0, 10))}`);
 
-  const statements: string[] = ["PRAGMA foreign_keys=ON;", "BEGIN TRANSACTION;"];
+  const statements: string[] = ["PRAGMA foreign_keys=ON;"];
   const counts: Record<string, number> = {};
   for (const table of TABLES) {
     const exported = exportTable(db, table);
@@ -75,7 +85,6 @@ function main(): void {
     statements.push(`UPDATE glossary_keywords SET namespace=${quote(namespace)} WHERE namespace IS NULL OR namespace='';`);
     statements.push(`UPDATE memory_access_logs SET namespace=${quote(namespace)} WHERE namespace IS NULL OR namespace='';`);
   }
-  statements.push("COMMIT;");
 
   console.log(JSON.stringify({ input: dbPath, dryRun, counts, foreign_key_check: "ok" }, null, 2));
   if (!dryRun) {
