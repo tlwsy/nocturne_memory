@@ -1,0 +1,39 @@
+name: Cloudflare D1 Backup
+
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci
+        working-directory: cloudflare
+      - name: Export D1
+        run: |
+          mkdir -p backups
+          npx wrangler d1 export nocturne-memory --remote --output backups/nocturne-memory.sql
+          gzip -9 backups/nocturne-memory.sql
+        working-directory: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Upload backup to private R2
+        run: |
+          DAY=$(date -u +%Y-%m-%d)
+          npx wrangler r2 object put nocturne-memory-private/backups/d1/nocturne-memory-${DAY}.sql.gz --file backups/nocturne-memory.sql.gz
+        working-directory: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Verify export is readable
+        run: gzip -t backups/nocturne-memory.sql.gz
+        working-directory: cloudflare

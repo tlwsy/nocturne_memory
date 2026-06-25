@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS glossary_keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL,node_uuid TEXT NOT NULL REFERENCES nodes(uuid) ON DELETE CASCADE,namespace TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(keyword,node_uuid,namespace));
+CREATE INDEX IF NOT EXISTS idx_glossary_namespace_keyword ON glossary_keywords(namespace,keyword);
+CREATE TABLE IF NOT EXISTS search_documents(namespace TEXT NOT NULL DEFAULT '',domain TEXT NOT NULL,path TEXT NOT NULL,node_uuid TEXT NOT NULL REFERENCES nodes(uuid) ON DELETE CASCADE,memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,uri TEXT NOT NULL,content TEXT NOT NULL,disclosure TEXT,search_terms TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(namespace,domain,path));
+CREATE INDEX IF NOT EXISTS idx_search_documents_node ON search_documents(node_uuid);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_documents_fts USING fts5(namespace UNINDEXED,domain UNINDEXED,path,node_uuid UNINDEXED,uri,content,disclosure,search_terms,tokenize='trigram');
+CREATE TABLE IF NOT EXISTS memory_access_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,node_uuid TEXT NOT NULL REFERENCES nodes(uuid) ON DELETE CASCADE,namespace TEXT NOT NULL DEFAULT '',accessed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,context TEXT);
+CREATE INDEX IF NOT EXISTS idx_access_logs_time ON memory_access_logs(accessed_at);
+CREATE INDEX IF NOT EXISTS idx_access_logs_node ON memory_access_logs(node_uuid);
+CREATE TABLE IF NOT EXISTS presets(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,boot_uris TEXT NOT NULL DEFAULT '{}',path_masks TEXT,is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN(0,1)),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_presets_active ON presets(is_active) WHERE is_active=1;
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+INSERT OR IGNORE INTO settings(key,value_json) VALUES('valid_domains','["core","writer","game","notes","narrative"]'),('locale','null'),('public_readonly_mcp','false');
+INSERT OR IGNORE INTO presets(name,boot_uris,is_active) VALUES('Default','{"": ["core://agent", "core://my_user", "core://agent/my_user"]}',1);

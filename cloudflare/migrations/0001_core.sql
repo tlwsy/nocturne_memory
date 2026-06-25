@@ -1,0 +1,11 @@
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS nodes(uuid TEXT PRIMARY KEY,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,last_accessed_at TEXT);
+CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY AUTOINCREMENT,node_uuid TEXT REFERENCES nodes(uuid) ON DELETE CASCADE,content TEXT NOT NULL,deprecated INTEGER NOT NULL DEFAULT 0 CHECK(deprecated IN(0,1)),migrated_to INTEGER REFERENCES memories(id) DEFERRABLE INITIALLY DEFERRED,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_memories_node_uuid ON memories(node_uuid);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memories_active_node ON memories(node_uuid) WHERE deprecated=0;
+CREATE TABLE IF NOT EXISTS edges(id INTEGER PRIMARY KEY AUTOINCREMENT,parent_uuid TEXT REFERENCES nodes(uuid) ON DELETE CASCADE,child_uuid TEXT NOT NULL REFERENCES nodes(uuid) ON DELETE CASCADE,name TEXT NOT NULL CHECK(length(name)<=256),priority INTEGER NOT NULL DEFAULT 0 CHECK(priority>=0),disclosure TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(parent_uuid,child_uuid));
+CREATE INDEX IF NOT EXISTS idx_edges_parent ON edges(parent_uuid);
+CREATE INDEX IF NOT EXISTS idx_edges_child ON edges(child_uuid);
+CREATE TABLE IF NOT EXISTS paths(namespace TEXT NOT NULL DEFAULT '' CHECK(length(namespace)<=64),domain TEXT NOT NULL DEFAULT 'core' CHECK(length(domain)<=64),path TEXT NOT NULL CHECK(length(path)<=512),edge_id INTEGER REFERENCES edges(id) ON DELETE CASCADE,node_uuid TEXT NOT NULL REFERENCES nodes(uuid) ON DELETE CASCADE,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(namespace,domain,path));
+CREATE INDEX IF NOT EXISTS idx_paths_node_uuid ON paths(node_uuid);
+CREATE INDEX IF NOT EXISTS idx_paths_edge_id ON paths(edge_id);
