@@ -80,15 +80,15 @@ export function createMemoryMcpServer(env: AppEnv, namespace: string): McpServer
   server.tool(
     "add_alias",
     {
-      source_uri: z.string(),
-      alias_uri: z.string(),
+      new_uri: z.string(),
+      target_uri: z.string(),
       priority: z.number().int().min(0).default(0),
       disclosure: z.string().default(""),
     },
-    async ({ source_uri, alias_uri, priority, disclosure }) => {
+    async ({ new_uri, target_uri, priority, disclosure }) => {
       try {
-        const result = await service.addAlias(source_uri, alias_uri, priority, disclosure);
-        return text(`Success: Added alias '${result.uri}' for '${source_uri}'`);
+        const result = await service.addAlias(target_uri, new_uri, priority, disclosure);
+        return text(`Success: Alias '${result.uri}' now points to same memory as '${target_uri}'`);
       } catch (error) {
         return text(`Error: ${error instanceof Error ? error.message : String(error)}`);
       }

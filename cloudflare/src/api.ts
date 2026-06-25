@@ -52,8 +52,10 @@ api.delete("/browse/node", async (c) => {
 });
 
 api.post("/browse/node/alias", async (c) => {
-  const body = await c.req.json<{ source_uri?: string; target_uri?: string; alias_uri?: string; priority?: number; disclosure?: string }>();
-  return c.json(await c.var.service.addAlias(body.source_uri ?? body.target_uri ?? "", body.alias_uri ?? "", body.priority ?? 0, body.disclosure ?? ""));
+  const body = await c.req.json<{ source_uri?: string; target_uri?: string; alias_uri?: string; new_uri?: string; priority?: number; disclosure?: string }>();
+  const targetUri = body.target_uri ?? body.source_uri ?? "";
+  const newUri = body.new_uri ?? body.alias_uri ?? "";
+  return c.json(await c.var.service.addAlias(targetUri, newUri, body.priority ?? 0, body.disclosure ?? ""));
 });
 
 api.post("/browse/node/rename", async (c) => {
