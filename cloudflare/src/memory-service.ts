@@ -241,18 +241,18 @@ export class MemoryService {
     const parentDepth = prefix ? prefix.split("/").length - 1 : -1;
     const rows = await this.all<{ path: string; node_uuid: string; priority: number | null; disclosure: string | null; content: string | null; approx_children_count: number }>(
       `SELECT p.path,p.node_uuid,e.priority,e.disclosure,sd.content,
-              (SELECT count(*) FROM paths c WHERE c.namespace=p.namespace AND c.domain=p.domain AND c.path LIKE p.path || '/%') AS approx_children_count
+              (SELECT count(*) FROM paths c WHERE c.namespace=p.namespace AND c.domain=p.domain AND instr(c.path,p.path || '/')=1) AS approx_children_count
        FROM paths p LEFT JOIN edges e ON p.edge_id=e.id
        LEFT JOIN search_documents sd ON sd.namespace=p.namespace AND sd.domain=p.domain AND sd.path=p.path
        WHERE p.namespace=? AND p.domain=? AND p.path<>?
-         AND (?='' AND instr(p.path,'/')=0 OR ?<>'' AND p.path LIKE ? AND ${depthExpr}=?)
+         AND ((?='' AND instr(p.path,'/')=0) OR (?<>'' AND instr(p.path,?)=1 AND ${depthExpr}=?))
        ORDER BY coalesce(e.priority,999),p.path`,
       this.namespace,
       domain,
       prefix,
       prefix,
       prefix,
-      `${prefix}/%`,
+      `${prefix}/`,
       parentDepth + 1,
     );
     return rows.map((r) => ({
@@ -347,12 +347,14 @@ export class MemoryService {
     const parsed = parseMemoryUri(uri);
     const row = await this.pathRow(parsed.domain, parsed.path);
     if (!row) throw new Error(`Memory not found: ${uri}`);
-    const prefix = parsed.path ? `${parsed.path}/%` : "%";
+    const prefix = parsed.path ? `${parsed.path}/` : "";
     const rows = await this.all<PathRow>(
-      "SELECT namespace,domain,path,edge_id,node_uuid FROM paths WHERE namespace=? AND domain=? AND (path=? OR path LIKE ?) ORDER BY length(path) DESC",
+      "SELECT namespace,domain,path,edge_id,node_uuid FROM paths WHERE namespace=? AND domain=? AND (path=? OR (?<>'' AND instr(path,?)=1) OR (?='' AND path<>'')) ORDER BY length(path) DESC",
       this.namespace,
       parsed.domain,
       parsed.path,
+      prefix,
+      prefix,
       prefix,
     );
     const stmts: D1PreparedStatement[] = [];
