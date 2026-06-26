@@ -7,6 +7,27 @@ import { makeUri, namespaceFromRequest, normalizePath, parseMemoryUri } from "./
 type Vars = { namespace: string; service: MemoryService };
 export const api = new Hono<{ Bindings: AppEnv; Variables: Vars }>();
 
+type ChangesetRow = {
+  row_key: string;
+  table_name: string;
+  node_uuid: string | null;
+  before_json: string | null;
+  after_json: string | null;
+  updated_at: string;
+};
+
+type PathNamespaceRow = {
+  namespace: string;
+  domain: string;
+  path: string;
+  node_uuid: string;
+};
+
+type ParsedChangesetRow = ChangesetRow & {
+  before_value: unknown;
+  after_value: unknown;
+};
+
 function breadcrumbs(path: string): Array<{ path: string; label: string }> {
   const items = [{ path: "", label: "root" }];
   let accumulated = "";
@@ -52,6 +73,70 @@ function toBrowseNodePayload(view: Awaited<ReturnType<MemoryService["getNode"]>>
     })),
     breadcrumbs: breadcrumbs(view.path),
   };
+}
+
+function parseStoredJson(raw: string | null): unknown {
+  if (raw == null || raw === "") return null;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function stringField(record: Record<string, unknown> | null, key: string): string | null {
+  const value = record?.[key];
+  return typeof value === "string" ? value : null;
+}
+
+function numberField(record: Record<string, unknown> | null, key: string): number | null {
+  const value = record?.[key];
+  return typeof value === "number" ? value : null;
+}
+
+function pathUriFromRecord(record: Record<string, unknown> | null): string | null {
+  const domain = stringField(record, "domain");
+  const path = stringField(record, "path");
+  return domain != null && path != null ? makeUri(domain, path) : null;
+}
+
+function namespaceFromRecord(record: Record<string, unknown> | null): string | null {
+  return stringField(record, "namespace");
+}
+
+function parseChangesetRows(rows: ChangesetRow[]): ParsedChangesetRow[] {
+  return rows.map((row) => ({
+    ...row,
+    before_value: parseStoredJson(row.before_json),
+    after_value: parseStoredJson(row.after_json),
+  }));
+}
+
+function actionForRows(rows: ParsedChangesetRow[]): "created" | "deleted" | "modified" {
+  if (rows.length > 0 && rows.every((row) => row.after_value == null)) return "deleted";
+  if (rows.length > 0 && rows.every((row) => row.before_value == null)) return "created";
+  return "modified";
+}
+
+function topLevelTable(rows: ChangesetRow[]): string {
+  const preferred = ["memories", "paths", "edges", "glossary_keywords", "nodes", "attachments"];
+  for (const table of preferred) {
+    if (rows.some((row) => row.table_name === table)) return table;
+  }
+  return rows[0]?.table_name ?? "memories";
+}
+
+function latestTimestamp(rows: ChangesetRow[]): string | null {
+  return rows.reduce<string | null>((latest, row) => (latest == null || row.updated_at > latest ? row.updated_at : latest), null);
+}
+
+function addPathNamespace(target: Record<string, string[]>, uri: string, namespace: string): void {
+  target[uri] ??= [];
+  if (!target[uri].includes(namespace)) target[uri].push(namespace);
 }
 
 api.use("*", async (c, next) => {
@@ -294,14 +379,145 @@ api.post("/presets/:id/duplicate", async (c) => {
 
 api.get("/review/groups", async (c) => {
   const rows = await c.env.DB.prepare(
-    `SELECT node_uuid,count(*) AS changes,max(updated_at) AS updated_at
-     FROM changeset_rows GROUP BY node_uuid ORDER BY updated_at DESC`,
-  ).all();
-  return c.json(rows.results ?? []);
+    `SELECT row_key,table_name,node_uuid,before_json,after_json,updated_at
+     FROM changeset_rows WHERE node_uuid IS NOT NULL ORDER BY updated_at DESC`,
+  ).all<ChangesetRow>();
+  const changes = rows.results ?? [];
+  if (changes.length === 0) return c.json([]);
+
+  const nodeUuids = [...new Set(changes.map((row) => row.node_uuid).filter((uuid): uuid is string => typeof uuid === "string" && uuid.length > 0))];
+  const pathRows = nodeUuids.length > 0
+    ? (await c.env.DB.prepare(
+      `SELECT namespace,domain,path,node_uuid FROM paths
+       WHERE node_uuid IN (${nodeUuids.map(() => "?").join(",")})
+       ORDER BY namespace,domain,path`,
+    ).bind(...nodeUuids).all<PathNamespaceRow>()).results ?? []
+    : [];
+  const currentPaths = new Map<string, PathNamespaceRow[]>();
+  for (const pathRow of pathRows) {
+    const bucket = currentPaths.get(pathRow.node_uuid) ?? [];
+    bucket.push(pathRow);
+    currentPaths.set(pathRow.node_uuid, bucket);
+  }
+
+  const grouped = new Map<string, ChangesetRow[]>();
+  for (const row of changes) {
+    if (!row.node_uuid) continue;
+    const bucket = grouped.get(row.node_uuid) ?? [];
+    bucket.push(row);
+    grouped.set(row.node_uuid, bucket);
+  }
+
+  const payload = [...grouped.entries()].map(([nodeUuid, groupRows]) => {
+    const parsedRows = parseChangesetRows(groupRows);
+    const namespaces = new Set<string>();
+    const activePaths = currentPaths.get(nodeUuid) ?? [];
+    for (const pathRow of activePaths) namespaces.add(pathRow.namespace);
+    const currentUri = activePaths[0] ? makeUri(activePaths[0].domain, activePaths[0].path) : null;
+    let displayUri = currentUri;
+    for (const row of parsedRows) {
+      const beforeRecord = asRecord(row.before_value);
+      const afterRecord = asRecord(row.after_value);
+      const beforeNamespace = namespaceFromRecord(beforeRecord);
+      const afterNamespace = namespaceFromRecord(afterRecord);
+      if (beforeNamespace != null) namespaces.add(beforeNamespace);
+      if (afterNamespace != null) namespaces.add(afterNamespace);
+      displayUri ??= pathUriFromRecord(afterRecord) ?? pathUriFromRecord(beforeRecord);
+    }
+    return {
+      node_uuid: nodeUuid,
+      display_uri: displayUri ?? `node://${nodeUuid}`,
+      namespaces: [...namespaces].sort(),
+      top_level_table: topLevelTable(groupRows),
+      action: actionForRows(parsedRows),
+      row_count: groupRows.length,
+      changes: groupRows.length,
+      updated_at: latestTimestamp(groupRows),
+    };
+  });
+  payload.sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
+  return c.json(payload);
 });
 api.get("/review/groups/:nodeUuid/diff", async (c) => {
-  const rows = await c.env.DB.prepare("SELECT * FROM changeset_rows WHERE node_uuid=? ORDER BY updated_at").bind(c.req.param("nodeUuid")).all();
-  return c.json({ node_uuid: c.req.param("nodeUuid"), rows: rows.results ?? [] });
+  const nodeUuid = c.req.param("nodeUuid");
+  const [rowsResult, pathResult, memory] = await Promise.all([
+    c.env.DB.prepare(
+      "SELECT row_key,table_name,node_uuid,before_json,after_json,updated_at FROM changeset_rows WHERE node_uuid=? ORDER BY updated_at",
+    ).bind(nodeUuid).all<ChangesetRow>(),
+    c.env.DB.prepare("SELECT namespace,domain,path,node_uuid FROM paths WHERE node_uuid=? ORDER BY namespace,domain,path").bind(nodeUuid).all<PathNamespaceRow>(),
+    c.env.DB.prepare("SELECT content FROM memories WHERE node_uuid=? AND deprecated=0 ORDER BY id DESC LIMIT 1").bind(nodeUuid).first<{ content: string }>(),
+  ]);
+  const rows = rowsResult.results ?? [];
+  const parsedRows = parseChangesetRows(rows);
+  const action = actionForRows(parsedRows);
+  const pathRows = pathResult.results ?? [];
+  const activePaths = pathRows.map((row) => makeUri(row.domain, row.path));
+  const pathNamespaces: Record<string, string[]> = {};
+  for (const row of pathRows) addPathNamespace(pathNamespaces, makeUri(row.domain, row.path), row.namespace);
+
+  let beforeContent = "";
+  let currentContent = memory?.content ?? "";
+  const beforeMeta: Record<string, number | string | null> = {};
+  const currentMeta: Record<string, number | string | null> = {};
+  const pathChanges: Array<{ action: "added" | "deleted"; uri: string; namespace: string | null }> = [];
+  const glossaryChanges: Array<{ action: "added" | "deleted"; keyword: string }> = [];
+
+  for (const row of parsedRows) {
+    const beforeRecord = asRecord(row.before_value);
+    const afterRecord = asRecord(row.after_value);
+    if (row.table_name === "memories") {
+      const before = stringField(beforeRecord, "content");
+      const after = stringField(afterRecord, "content");
+      if (before != null) beforeContent = before;
+      if (after != null) currentContent = after;
+    }
+    if (row.table_name === "edges") {
+      if (beforeRecord) {
+        beforeMeta.priority = numberField(beforeRecord, "priority");
+        beforeMeta.disclosure = stringField(beforeRecord, "disclosure");
+      }
+      if (afterRecord) {
+        currentMeta.priority = numberField(afterRecord, "priority");
+        currentMeta.disclosure = stringField(afterRecord, "disclosure");
+      }
+    }
+    if (row.table_name === "paths") {
+      const beforeUri = pathUriFromRecord(beforeRecord);
+      const afterUri = pathUriFromRecord(afterRecord);
+      const beforeNamespace = namespaceFromRecord(beforeRecord);
+      const afterNamespace = namespaceFromRecord(afterRecord);
+      if (beforeUri && (!afterUri || beforeUri !== afterUri || beforeNamespace !== afterNamespace)) {
+        pathChanges.push({ action: "deleted", uri: beforeUri, namespace: beforeNamespace });
+      }
+      if (afterUri && (!beforeUri || beforeUri !== afterUri || beforeNamespace !== afterNamespace)) {
+        pathChanges.push({ action: "added", uri: afterUri, namespace: afterNamespace });
+      }
+    }
+    if (row.table_name === "glossary_keywords") {
+      const beforeKeyword = stringField(beforeRecord, "keyword");
+      const afterKeyword = stringField(afterRecord, "keyword");
+      if (beforeKeyword && beforeKeyword !== afterKeyword) glossaryChanges.push({ action: "deleted", keyword: beforeKeyword });
+      if (afterKeyword && beforeKeyword !== afterKeyword) glossaryChanges.push({ action: "added", keyword: afterKeyword });
+    }
+  }
+
+  if (action === "created" && beforeContent === "") currentContent = currentContent || memory?.content || "";
+  if (action === "deleted") currentContent = "";
+
+  return c.json({
+    node_uuid: nodeUuid,
+    rows,
+    action,
+    before_content: beforeContent,
+    current_content: currentContent,
+    before_meta: beforeMeta,
+    current_meta: currentMeta,
+    path_changes: pathChanges,
+    glossary_changes: glossaryChanges,
+    active_paths: activePaths,
+    path_namespaces: pathNamespaces,
+    has_changes: beforeContent !== currentContent || pathChanges.length > 0 || glossaryChanges.length > 0 || JSON.stringify(beforeMeta) !== JSON.stringify(currentMeta),
+  });
 });
 api.post("/review/groups/:nodeUuid/rollback", async (c) => {
   await c.env.DB.prepare("DELETE FROM changeset_rows WHERE node_uuid=?").bind(c.req.param("nodeUuid")).run();
